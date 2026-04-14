@@ -431,6 +431,24 @@
           <input type="number" id="maxRetries" min="0" max="30" value="3" step="1" />
           <p class="hint">创建任务失败、无 task_id、轮询报错或任务状态为 failed/error 时会自动从头再跑。</p>
         </div>
+        <div class="row">
+          <div class="field">
+            <label for="runMode">运行模式</label>
+            <select id="runMode">
+              <option value="single">单段（默认）</option>
+              <option value="continuation" selected>续接两段（2 x 8s）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="seg2Retries">第二段失败重试次数</label>
+            <input type="number" id="seg2Retries" min="0" max="10" value="1" step="1" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="continuationSuffix">续接补充提示词（自动拼接到第二段 Prompt）</label>
+          <textarea id="continuationSuffix">请无缝承接上一段末帧继续拍摄，主体、服饰、场景保持一致，动作自然延续。</textarea>
+          <p class="hint">续接模式下会把第一段末帧作为第二段首图输入。</p>
+        </div>
         <div class="actions">
           <button type="button" class="primary" id="btnRun">生成视频</button>
           <button type="button" class="secondary" id="btnClearLog">清空日志</button>
@@ -469,6 +487,9 @@
       const enhanceEl = document.getElementById("enhance");
       const upsampleEl = document.getElementById("upsample");
       const maxRetriesEl = document.getElementById("maxRetries");
+      const runModeEl = document.getElementById("runMode");
+      const seg2RetriesEl = document.getElementById("seg2Retries");
+      const continuationSuffixEl = document.getElementById("continuationSuffix");
       const infoBox = document.getElementById("infoBox");
       const btnRun = document.getElementById("btnRun");
       const btnClearLog = document.getElementById("btnClearLog");
@@ -592,6 +613,14 @@
         return Math.min(30, n);
       }
 
+      function parseSeg2Retries() {
+        const n = parseInt((seg2RetriesEl && seg2RetriesEl.value) || "0", 10);
+        if (isNaN(n) || n < 0) {
+          return 0;
+        }
+        return Math.min(10, n);
+      }
+
       async function createVideo(payload) {
         const res = await fetch(baseUrl() + "/v1/video/create", {
           method: "POST",
@@ -644,6 +673,115 @@
         );
       }
 
+      async function extractLastFrameDataUrl(videoUrl) {
+        const video = document.createElement("video");
+        video.crossOrigin = "anonymous";
+        video.preload = "auto";
+        video.muted = true;
+        video.playsInline = true;
+
+        await new Promise(function (resolve, reject) {
+          video.onloadedmetadata = resolve;
+          video.onerror = function () {
+            reject(new Error("第一段视频元数据读取失败，无法提取末帧"));
+          };
+          video.src = videoUrl;
+        });
+
+        const targetTime = Math.max(0, (video.duration || 0) - 0.05);
+        await new Promise(function (resolve, reject) {
+          video.onseeked = resolve;
+          video.onerror = function () {
+            reject(new Error("第一段视频 seek 失败，无法提取末帧"));
+          };
+          video.currentTime = targetTime;
+        });
+
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(2, video.videoWidth || 720);
+        canvas.height = Math.max(2, video.videoHeight || 1280);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          throw new Error("无法创建 Canvas 上下文");
+        }
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        return canvas.toDataURL("image/jpeg", 0.92);
+      }
+
+      async function runSingle(payload) {
+        log("提交单段任务…");
+        const created = await createVideo(payload);
+        log("创建响应: " + JSON.stringify(created));
+        const taskId = created.task_id || created.id;
+        if (!taskId) {
+          throw new Error("未获取 task_id / id");
+        }
+        log("任务 ID: " + taskId);
+        const out = await waitForVideo(taskId);
+        if (!out.videoUrl) {
+          throw new Error("单段任务失败");
+        }
+        return out.videoUrl;
+      }
+
+      async function runContinuation(payload) {
+        log("提交第1段任务…");
+        const created1 = await createVideo(payload);
+        log("[segment1] 创建响应: " + JSON.stringify(created1));
+        const taskId1 = created1.task_id || created1.id;
+        if (!taskId1) {
+          throw new Error("[segment1] 未获取 task_id / id");
+        }
+        log("[segment1] 任务 ID: " + taskId1);
+        const seg1 = await waitForVideo(taskId1);
+        if (!seg1.videoUrl) {
+          throw new Error("[segment1] 失败");
+        }
+
+        log("[segment1] 提取末帧中…");
+        const lastFrameDataUrl = await extractLastFrameDataUrl(seg1.videoUrl);
+        log("[segment1] 末帧提取完成");
+
+        const suffix = (continuationSuffixEl.value || "").trim();
+        const payload2 = {
+          prompt: payload.prompt + (suffix ? "\n\n" + suffix : ""),
+          model: payload.model,
+          images: [lastFrameDataUrl],
+          enhance_prompt: payload.enhance_prompt,
+          enable_upsample: payload.enable_upsample,
+          aspect_ratio: payload.aspect_ratio,
+        };
+
+        const maxTry = parseSeg2Retries();
+        for (let i = 0; i <= maxTry; i++) {
+          if (i > 0) {
+            log("[segment2] 第 " + i + " 次重试…");
+          } else {
+            log("提交第2段任务…");
+          }
+          const created2 = await createVideo(payload2);
+          log("[segment2] 创建响应: " + JSON.stringify(created2));
+          const taskId2 = created2.task_id || created2.id;
+          if (!taskId2) {
+            if (i === maxTry) {
+              throw new Error("[segment2] 未获取 task_id / id");
+            }
+            continue;
+          }
+          log("[segment2] 任务 ID: " + taskId2);
+          const seg2 = await waitForVideo(taskId2);
+          if (seg2.videoUrl) {
+            log("续接完成：当前返回第2段 URL（浏览器端不做无损拼接）", "ok");
+            return seg2.videoUrl;
+          }
+          if (i === maxTry) {
+            throw new Error("[segment2] 连续失败，已达到重试上限");
+          }
+        }
+
+        throw new Error("[segment2] 未成功生成");
+      }
+
       async function waitForVideo(taskId) {
         let interval = 1000;
         while (true) {
@@ -688,7 +826,6 @@
 
         resetPreview();
         btnRun.disabled = true;
-        log("提交创建任务…");
 
         const payload = {
           prompt: prompt,
@@ -700,17 +837,32 @@
         };
 
         try {
-          const created = await createVideo(payload);
-          log("创建响应: " + JSON.stringify(created));
-          const taskId = created.task_id || created.id;
-          if (!taskId) {
-            log("未获取 task_id / id", "err");
-            return;
+          const mode = runModeEl.value || "single";
+          const maxRetries = parseMaxRetries();
+          let finalUrl = null;
+
+          for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            if (attempt > 0) {
+              log("整次流程重试第 " + attempt + " 次…");
+            }
+            try {
+              if (mode === "continuation") {
+                finalUrl = await runContinuation(payload);
+              } else {
+                finalUrl = await runSingle(payload);
+              }
+              break;
+            } catch (innerErr) {
+              log(String(innerErr.message || innerErr), "err");
+              if (attempt === maxRetries) {
+                throw innerErr;
+              }
+            }
           }
-          log("任务 ID: " + taskId);
-          const out = await waitForVideo(taskId);
-          if (out.videoUrl) {
-            showPreview(out.videoUrl);
+
+          if (finalUrl) {
+            showPreview(finalUrl);
+            log("流程结束，已更新预览", "ok");
           }
         } catch (e) {
           log(String(e.message || e), "err");
