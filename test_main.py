@@ -31,24 +31,46 @@ class TestMainHelpers(unittest.TestCase):
         self.assertEqual(main.pick_video_url({"output": {"video_url": "c"}}), "c")
         self.assertIsNone(main.pick_video_url({}))
 
-    def test_merge_videos_fallback_to_reencode(self):
+    def test_merge_videos_with_opencv_writer(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = f"{tmp}/final.mp4"
             p1 = f"{tmp}/a.mp4"
             p2 = f"{tmp}/b.mp4"
-            with open(p1, "wb") as f1:
-                f1.write(b"a")
-            with open(p2, "wb") as f2:
-                f2.write(b"b")
+            open(p1, "wb").close()
+            open(p2, "wb").close()
 
-            with mock.patch("main.subprocess.run") as run_mock:
-                run_mock.side_effect = [
-                    main.subprocess.CalledProcessError(1, "ffmpeg"),
-                    mock.Mock(),
-                ]
+            frame1 = mock.Mock()
+            frame1.shape = (100, 200, 3)
+            frame2 = mock.Mock()
+            frame2.shape = (120, 240, 3)
+
+            first_cap = mock.Mock()
+            first_cap.isOpened.return_value = True
+            first_cap.get.side_effect = [
+                25.0,
+                200,
+                100,
+            ]
+
+            cap1 = mock.Mock()
+            cap1.isOpened.return_value = True
+            cap1.read.side_effect = [(True, frame1), (False, None)]
+
+            cap2 = mock.Mock()
+            cap2.isOpened.return_value = True
+            cap2.read.side_effect = [(True, frame2), (False, None)]
+
+            writer = mock.Mock()
+            writer.isOpened.return_value = True
+
+            with mock.patch("main.cv2.VideoCapture", side_effect=[first_cap, cap1, cap2]), \
+                mock.patch("main.cv2.VideoWriter", return_value=writer), \
+                mock.patch("main.cv2.VideoWriter_fourcc", return_value=1234), \
+                mock.patch("main.cv2.resize", return_value=frame1) as resize_mock:
                 merged = main.merge_videos([p1, p2], out)
                 self.assertEqual(merged, out)
-                self.assertEqual(run_mock.call_count, 2)
+                self.assertEqual(writer.write.call_count, 2)
+                resize_mock.assert_called_once()
 
 
 if __name__ == "__main__":

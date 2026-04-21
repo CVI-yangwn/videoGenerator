@@ -4,9 +4,10 @@ import http.client
 import json
 import mimetypes
 import os
-import subprocess
 import time
 import urllib.request
+
+import cv2
 
 DEFAULT_PROMPT = """15 秒抖音视频提示词
 主题：白色灯芯绒短袖衬衫 + 短裤套装（保留服装原有版型）
@@ -99,66 +100,66 @@ def download_video(video_url, target_path):
 
 def extract_last_frame(video_path, frame_path):
     os.makedirs(os.path.dirname(frame_path), exist_ok=True)
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-sseof",
-        "-0.08",
-        "-i",
-        video_path,
-        "-vframes",
-        "1",
-        frame_path,
-    ]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开视频文件: {video_path}")
+
+    last_frame = None
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        last_frame = frame
+    cap.release()
+
+    if last_frame is None:
+        raise RuntimeError(f"视频中没有可用帧: {video_path}")
+
+    if not cv2.imwrite(frame_path, last_frame):
+        raise RuntimeError(f"写入末帧失败: {frame_path}")
     return frame_path
 
 
 def merge_videos(video_paths, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    concat_list = os.path.join(os.path.dirname(output_path), "concat_inputs.txt")
-    with open(concat_list, "w", encoding="utf-8") as f:
-        for p in video_paths:
-            f.write(f"file '{os.path.abspath(p)}'\n")
+    if not video_paths:
+        raise ValueError("video_paths 不能为空")
 
-    copy_cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concat_list,
-        "-c",
-        "copy",
-        output_path,
-    ]
-    reencode_cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        concat_list,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        output_path,
-    ]
+    first_cap = cv2.VideoCapture(video_paths[0])
+    if not first_cap.isOpened():
+        raise RuntimeError(f"无法打开视频文件: {video_paths[0]}")
+    fps = first_cap.get(cv2.CAP_PROP_FPS)
+    width = int(first_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(first_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    first_cap.release()
+
+    if fps <= 0:
+        fps = 30.0
+    if width <= 0 or height <= 0:
+        raise RuntimeError("无法读取输出视频尺寸")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"无法创建输出视频: {output_path}")
+
     try:
-        subprocess.run(copy_cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError:
-        subprocess.run(reencode_cmd, check=True, capture_output=True, text=True)
+        for path in video_paths:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                raise RuntimeError(f"无法打开视频文件: {path}")
+            try:
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        frame = cv2.resize(frame, (width, height))
+                    writer.write(frame)
+            finally:
+                cap.release()
+    finally:
+        writer.release()
     return output_path
 
 
@@ -244,7 +245,7 @@ def parse_args():
     parser.add_argument("--mode", choices=["single", "continuation"], default="continuation")
     parser.add_argument("--image", default="./4befb8bc9f787d21071022fac2a3baf5.jpg")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--model", default="veo3-fast-frames")
+    parser.add_argument("--model", default="veo_3_1-lite")
     parser.add_argument("--aspect-ratio", default="9:16")
     parser.add_argument("--continuation-suffix", default=DEFAULT_CONTINUATION_SUFFIX)
     parser.add_argument("--seg2-retries", type=int, default=1)
